@@ -7,7 +7,8 @@ A balls-vs-bricks shooter for Android. Aim once, fire the whole volley, and brea
 - Pickups: +1 ball rings, row and column lasers, scatter stars, coins
 - Power-ups: Bomb, x2 Damage, Row Clear
 - 12 ball skins in the shop
-- Fully offline, no ads, no tracking
+- Ads through Google AdMob, plus a one-time Remove Ads purchase
+- Plays fully offline (ads just don't load without internet)
 
 App ID: `com.golamlab.ricoshot`
 
@@ -15,9 +16,11 @@ App ID: `com.golamlab.ricoshot`
 
 ```
 www/                 the game itself (one index.html + bundled fonts)
+www/vendor/          Capacitor's bridge script, copied in by npm install
 android/             the Android app that wraps the game (Capacitor)
 assets/              icon and splash source images
 tools/level-bot.js   plays every level to check the shot limits are fair
+tools/copy-vendor.js copies the bridge script after npm install
 .github/workflows/   builds the APK on GitHub
 ```
 
@@ -62,6 +65,46 @@ The debug APK is for testing on your own phone. Google Play needs a signed `.aab
 Version numbers are set automatically: each GitHub build uses its run number as the `versionCode`, so every upload to Play is higher than the last.
 
 Never commit the `.jks` file. `.gitignore` already blocks it.
+
+## Ads and Remove Ads
+
+Right now the game uses Google's **test** ad IDs, so the APK shows sample ads labelled "Test Ad". They never pay, and you can tap them safely. In a desktop browser you get a pretend "TEST AD" screen instead, so you can try every placement without a phone.
+
+### Where ads appear
+
+| Placement | Type | When |
+|---|---|---|
+| +5 shots | Rewarded (player chooses) | Out of shots on a level, once per attempt |
+| Skip level | Rewarded | After failing the same level 3 times |
+| Double coins | Rewarded | On the level clear screen |
+| Free power-up | Rewarded | Tapping a power-up you have 0 of |
+| Second continue | Rewarded | Challenge game over, after the free continue is used |
+| Between games | Full-screen | After every 5 levels cleared, and every 3rd Challenge game over. Never two within 3 minutes. |
+| Banner | Banner | Level map and shop only, never during play |
+
+All of these numbers are in the `MONEY` block near the top of the script in `www/index.html`.
+
+**Remove Ads** turns off the full-screen and banner ads for good. The optional rewarded ads stay, because players choose those. The purchase is tied to the player's Google account, so it comes back after a reinstall or on a new phone (there's also a **Restore purchases** button in Settings).
+
+### Switching to real ads (AdMob)
+
+1. Create an account at admob.google.com, add an Android app, and create three ad units: **Interstitial**, **Rewarded** and **Banner** (adaptive).
+2. Put the **App ID** (`ca-app-pub-XXXX~YYYY`, with a `~`) in `android/app/src/main/res/values/strings.xml` as `admob_app_id`.
+3. Put the three **ad unit IDs** (`ca-app-pub-XXXX/ZZZZ`, with a `/`) in `MONEY.ADMOB` in `www/index.html`.
+4. Set `MONEY.TEST_MODE` to `false`.
+5. Never tap your own real ads. AdMob bans accounts for it. To keep testing on your phone after switching, add your phone as a test device in AdMob (Settings > Test devices).
+
+In Play Console you also need to declare that the app contains ads, fill in the Data safety form (AdMob collects device IDs for advertising), and set the target age to 13+ unless you want Google's Families ad rules.
+
+### Turning on Remove Ads (Google Play + RevenueCat)
+
+1. Upload a signed build to the Internal testing track in Play Console first. Play only lets you create products for an app it has seen.
+2. In Play Console > Monetize > Products > In-app products, create a product with ID `remove_ads` and set its price.
+3. Create a free account at revenuecat.com, add a Google Play app with package `com.golamlab.ricoshot`, and connect it to Play Console (RevenueCat walks you through the service account step).
+4. In RevenueCat, import the `remove_ads` product and attach it to an **entitlement** named `no_ads`.
+5. Copy RevenueCat's public Google API key (starts with `goog_`) into `MONEY.REVENUECAT_API_KEY` in `www/index.html`.
+
+To test a purchase without paying, add your Google account as a licence tester in Play Console (Settings > License testing) and install the app from the Internal testing link.
 
 ## Building on your own computer (optional)
 
