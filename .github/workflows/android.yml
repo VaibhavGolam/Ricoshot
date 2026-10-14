@@ -37,8 +37,16 @@ jobs:
       - name: Show Android SDK location
         run: echo "ANDROID_HOME=$ANDROID_HOME"
 
+      # --ignore-scripts skips package.json's postinstall; the next step does its job,
+      # so the build works even if tools/copy-vendor.js isn't in the repo.
       - name: Install packages
-        run: npm ci
+        run: npm ci --ignore-scripts
+
+      - name: Copy Capacitor bridge into the game
+        run: |
+          mkdir -p www/vendor
+          cp node_modules/@capacitor/core/dist/capacitor.js www/vendor/capacitor.js
+          ls -la www www/vendor
 
       - name: Copy the game into the Android project
         run: npx cap sync android
