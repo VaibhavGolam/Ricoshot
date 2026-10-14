@@ -32,8 +32,10 @@ jobs:
           java-version: 21
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # GitHub's Ubuntu runners already include the Android SDK (ANDROID_HOME is set),
+      # and Gradle downloads any missing SDK platform on its own, so no setup step is needed.
+      - name: Show Android SDK location
+        run: echo "ANDROID_HOME=$ANDROID_HOME"
 
       - name: Install packages
         run: npm ci
