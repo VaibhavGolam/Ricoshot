@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Ricoshot</string>
+    <string name="title_activity_main">Ricoshot</string>
+    <string name="package_name">com.golamlab.ricoshot</string>
+    <string name="custom_url_scheme">com.golamlab.ricoshot</string>
+</resources>

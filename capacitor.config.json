@@ -1,0 +1,9 @@
+{
+  "appId": "com.golamlab.ricoshot",
+  "appName": "Ricoshot",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#04050F",
+    "allowMixedContent": false
+  }
+}
