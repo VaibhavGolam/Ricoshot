@@ -49,6 +49,8 @@
 <body>
 <div id="wrap"><canvas id="c" tabindex="0" aria-label="Ricoshot game"></canvas></div>
 
+<!-- Capacitor bridge (copied from node_modules by tools/copy-vendor.js). Missing in a plain browser, which is fine. -->
+<script src="vendor/capacitor.js"></script>
 <script>
 (() => {
 'use strict';
@@ -610,12 +612,40 @@ function continueChallenge(G) {
 /*CORE-END*/
 
 /* =====================================================================
+   ADS + PURCHASES SETTINGS  (edit these before releasing)
+   The IDs below are Google's public TEST ids: they always show sample ads
+   and never pay. Swap in your own from AdMob, and set TEST_MODE to false.
+   ===================================================================== */
+const MONEY = {
+  TEST_MODE: true,
+  ADMOB: {
+    // App ID goes in android/app/src/main/res/values/strings.xml (admob_app_id)
+    interstitial: 'ca-app-pub-3940256099942544/1033173712',
+    rewarded: 'ca-app-pub-3940256099942544/5224354917',
+    banner: 'ca-app-pub-3940256099942544/9214589741',
+  },
+  INTERSTITIAL_EVERY_LEVELS: 5,        // full-screen ad after every 5 levels cleared
+  INTERSTITIAL_EVERY_CHALLENGE_RUNS: 3, // and after every 3rd Challenge game over
+  INTERSTITIAL_MIN_GAP_SEC: 180,       // never two full-screen ads within 3 minutes
+  EXTRA_SHOTS: 5,                      // rewarded: shots added when you run out
+  SKIP_AFTER_FAILS: 3,                 // rewarded: offer "skip level" after this many fails
+  BANNER_SCREENS: ['levels', 'shop'],  // banner only on these menu screens, never in play
+
+  // Remove Ads (one-time purchase via Google Play, handled by RevenueCat)
+  REVENUECAT_API_KEY: '',              // your public Google key from RevenueCat, starts with "goog_"
+  REMOVE_ADS_PRODUCT: 'remove_ads',    // product ID you create in Play Console
+  REMOVE_ADS_ENTITLEMENT: 'no_ads',    // entitlement ID you create in RevenueCat
+  REMOVE_ADS_PRICE_FALLBACK: '₹99', // shown until the store returns the real price
+};
+
+/* =====================================================================
    STORAGE
    ===================================================================== */
 const SAVE_KEY = 'ricoshot.save.v1';
 function defaultSave() {
   return { unlocked: 1, stars: {}, best: 0, coins: 60, skins: [0], skin: 0, sound: true,
-    inv: { bomb: CONFIG.START_INV, double: CONFIG.START_INV, row: CONFIG.START_INV } };
+    inv: { bomb: CONFIG.START_INV, double: CONFIG.START_INV, row: CONFIG.START_INV },
+    noAds: false, winsSinceAd: 0, runsSinceAd: 0, fails: {} };
 }
 let SAVE = defaultSave();
 try {
@@ -624,6 +654,7 @@ try {
     SAVE = Object.assign(defaultSave(), raw);
     SAVE.inv = Object.assign(defaultSave().inv, raw.inv || {});
     SAVE.stars = raw.stars || {};
+    SAVE.fails = raw.fails || {};
   }
 } catch (e) { /* storage blocked: play without saving */ }
 function persist() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(SAVE)); } catch (e) {} }
@@ -833,6 +864,210 @@ const ui = {
 let G = null;
 const particles = [], texts = [], beams = [], rings = [];
 
+/* =====================================================================
+   ADS + PURCHASES
+   Inside the Android app this talks to AdMob and Google Play (via RevenueCat).
+   In a browser with TEST_MODE on, it shows a pretend "TEST AD" screen so every
+   placement can be tried. With TEST_MODE off, the browser version has no ads.
+   ===================================================================== */
+const Ads = (() => {
+  const CE = window.capacitorExports;
+  let native = false;
+  try { native = !!(CE && CE.Capacitor && CE.Capacitor.isNativePlatform()); } catch (e) {}
+  const AdMob = native ? CE.registerPlugin('AdMob') : null;
+  const Purchases = native && MONEY.REVENUECAT_API_KEY ? CE.registerPlugin('Purchases') : null;
+  const ids = MONEY.ADMOB, testing = MONEY.TEST_MODE;
+  const st = {
+    ready: false, canRequest: true, privacyRequired: false,
+    rewardedReady: false, interReady: false, banner: false, bannerWanted: false,
+    lastFull: -1e9, busy: false, earned: false, shown: false,
+    onRewardDone: null, onInterDone: null, product: null, price: null, initP: null,
+  };
+  const now = () => performance.now() / 1000;
+
+  async function preloadRewarded() {
+    if (!AdMob || !st.ready || !st.canRequest || st.rewardedReady) return;
+    try { await AdMob.prepareRewardVideoAd({ adId: ids.rewarded, isTesting: testing }); st.rewardedReady = true; } catch (e) { st.rewardedReady = false; }
+  }
+  async function preloadInter() {
+    if (!AdMob || !st.ready || !st.canRequest || st.interReady || SAVE.noAds) return;
+    try { await AdMob.prepareInterstitial({ adId: ids.interstitial, isTesting: testing }); st.interReady = true; } catch (e) { st.interReady = false; }
+  }
+
+  async function init() {
+    if (AdMob) {
+      try {
+        await AdMob.initialize({ initializeForTesting: testing });
+        // Consent popup (required for players in Europe/UK; does nothing elsewhere)
+        let info = await AdMob.requestConsentInfo();
+        if (info.isConsentFormAvailable && info.status === 'REQUIRED') info = await AdMob.showConsentForm();
+        st.canRequest = info.canRequestAds !== false;
+        st.privacyRequired = info.privacyOptionsRequirementStatus === 'REQUIRED';
+        AdMob.addListener('onRewardedVideoAdShowed', () => { st.shown = true; });
+        AdMob.addListener('onRewardedVideoAdReward', () => { st.earned = true; });
+        AdMob.addListener('onRewardedVideoAdDismissed', () => { if (st.onRewardDone) st.onRewardDone(); });
+        AdMob.addListener('onRewardedVideoAdFailedToShow', () => { if (st.onRewardDone) st.onRewardDone(); });
+        AdMob.addListener('interstitialAdDismissed', () => { if (st.onInterDone) st.onInterDone(); });
+        AdMob.addListener('interstitialAdFailedToShow', () => { if (st.onInterDone) st.onInterDone(); });
+        st.ready = true;
+        preloadRewarded(); preloadInter();
+      } catch (e) { console.warn('AdMob init failed', e); }
+    }
+    if (Purchases) {
+      try {
+        await Purchases.configure({ apiKey: MONEY.REVENUECAT_API_KEY });
+        await refreshPurchases();
+        const r = await Purchases.getProducts({ productIdentifiers: [MONEY.REMOVE_ADS_PRODUCT], type: 'NON_SUBSCRIPTION' });
+        st.product = (r && r.products && r.products[0]) || null;
+        st.price = st.product ? st.product.priceString : null;
+      } catch (e) { console.warn('Store init failed', e); }
+    } else if (native) {
+      console.warn('Remove Ads is off: set MONEY.REVENUECAT_API_KEY');
+    }
+  }
+
+  // Remove Ads lives on the player's Google account: RevenueCat asks Google Play,
+  // so a reinstall or a new phone with the same account gets it back.
+  function applyCustomerInfo(info) {
+    const active = (info && info.entitlements && info.entitlements.active) || {};
+    const owned = !!active[MONEY.REMOVE_ADS_ENTITLEMENT];
+    if (owned !== SAVE.noAds) { SAVE.noAds = owned; persist(); }
+    return owned;
+  }
+  async function refreshPurchases() {
+    if (!Purchases) return false;
+    const r = await Purchases.getCustomerInfo();
+    return applyCustomerInfo(r && r.customerInfo);
+  }
+
+  // Rewarded ad. Resolves 'earned', 'skipped' (closed early) or 'unavailable'.
+  function rewarded() {
+    if (st.busy) return Promise.resolve('busy');
+    if (!native) return testing ? fakeAd(true) : Promise.resolve('earned');
+    if (!AdMob || !st.ready || !st.canRequest) return Promise.resolve('unavailable');
+    st.busy = true;
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => {
+        if (done) return; done = true;
+        st.busy = false; st.onRewardDone = null; st.rewardedReady = false;
+        resolve(v); setTimeout(preloadRewarded, 500);
+      };
+      st.earned = false; st.shown = false;
+      st.onRewardDone = () => setTimeout(() => finish(st.earned ? 'earned' : 'skipped'), 300);
+      setTimeout(() => finish(st.earned ? 'earned' : 'unavailable'), 180000); // safety net
+      (async () => {
+        try {
+          if (!st.rewardedReady) await AdMob.prepareRewardVideoAd({ adId: ids.rewarded, isTesting: testing });
+          st.rewardedReady = false;
+          await AdMob.showRewardVideoAd();
+          st.earned = true;
+        } catch (e) {
+          setTimeout(() => finish(st.earned ? 'earned' : (st.shown ? 'skipped' : 'unavailable')), 600);
+        }
+      })();
+    });
+  }
+
+  // Full-screen ad between games, only when one is due. Calls next() either way.
+  // It only shows an ad that has already loaded, so the player never waits on the network.
+  function between(kind, next) {
+    const every = kind === 'level' ? MONEY.INTERSTITIAL_EVERY_LEVELS : MONEY.INTERSTITIAL_EVERY_CHALLENGE_RUNS;
+    const count = kind === 'level' ? SAVE.winsSinceAd : SAVE.runsSinceAd;
+    const due = !SAVE.noAds && count >= every && now() - st.lastFull >= MONEY.INTERSTITIAL_MIN_GAP_SEC;
+    if (!due || st.busy) { next(); return; }
+    const reset = () => {
+      st.lastFull = now();
+      if (kind === 'level') SAVE.winsSinceAd = 0; else SAVE.runsSinceAd = 0;
+      persist();
+    };
+    if (!native) { if (!testing) { next(); return; } reset(); fakeAd(false).then(next); return; }
+    if (!AdMob || !st.ready || !st.canRequest || !st.interReady) { preloadInter(); next(); return; }
+    st.busy = true;
+    let done = false;
+    const finish = () => {
+      if (done) return; done = true;
+      st.busy = false; st.onInterDone = null; st.interReady = false;
+      next(); setTimeout(preloadInter, 500);
+    };
+    st.onInterDone = finish;
+    reset();
+    AdMob.showInterstitial().catch(finish);
+    setTimeout(finish, 120000);
+  }
+
+  // Banner on menu screens only. Called every frame; only acts on a change.
+  function setBanner(want) {
+    want = !!want && !SAVE.noAds;
+    if (!native) { st.bannerWanted = want && testing; return; }
+    if (!AdMob || !st.ready || !st.canRequest || want === st.bannerWanted) return;
+    st.bannerWanted = want;
+    if (want) {
+      if (st.banner) AdMob.resumeBanner().catch(() => {});
+      else AdMob.showBanner({ adId: ids.banner, adSize: 'ADAPTIVE_BANNER', position: 'BOTTOM_CENTER', margin: 0, isTesting: testing })
+        .then(() => { st.banner = true; }).catch(() => { st.bannerWanted = false; });
+    } else if (st.banner) AdMob.hideBanner().catch(() => {});
+  }
+
+  // Remove Ads purchase. Resolves 'owned', 'cancelled', 'failed', 'web' or 'nostore'.
+  async function buyRemoveAds() {
+    if (SAVE.noAds) return 'owned';
+    if (!native) return 'web';
+    if (!Purchases) return 'nostore';
+    try {
+      await st.initP;
+      if (!st.product) {
+        const r = await Purchases.getProducts({ productIdentifiers: [MONEY.REMOVE_ADS_PRODUCT], type: 'NON_SUBSCRIPTION' });
+        st.product = (r && r.products && r.products[0]) || null;
+      }
+      if (!st.product) return 'nostore';
+      const r = await Purchases.purchaseStoreProduct({ product: st.product });
+      const owned = applyCustomerInfo(r && r.customerInfo);
+      if (owned) setBanner(false);
+      return owned ? 'owned' : 'failed';
+    } catch (e) {
+      const cancelled = e && (e.userCancelled || String(e.code) === '1' || /cancel/i.test(String(e.message || e)));
+      return cancelled ? 'cancelled' : 'failed';
+    }
+  }
+  async function restore() {
+    if (!native) return 'web';
+    if (!Purchases) return 'nostore';
+    try {
+      await st.initP;
+      const r = await Purchases.restorePurchases();
+      return applyCustomerInfo(r && r.customerInfo) ? 'owned' : 'none';
+    } catch (e) { return 'failed'; }
+  }
+  function privacyForm() { if (AdMob) AdMob.showPrivacyOptionsForm().catch(() => {}); }
+
+  // Browser stand-in for a real ad, so placements can be tested without a phone.
+  function fakeAd(isRewarded) {
+    return new Promise((resolve) => { ui.fakeAd = { t: 0, rewarded: isRewarded, need: isRewarded ? 5 : 2, resolve }; });
+  }
+
+  st.initP = new Promise((r) => setTimeout(() => init().then(r, r), 400));
+  return {
+    rewarded, between, setBanner, buyRemoveAds, restore, privacyForm,
+    get native() { return native; },
+    get price() { return st.price || MONEY.REMOVE_ADS_PRICE_FALLBACK; },
+    get privacyRequired() { return st.privacyRequired; },
+    get bannerWanted() { return st.bannerWanted; },
+  };
+})();
+
+// Play a rewarded ad, then run onEarn only if the player watched it to the end.
+function withReward(onEarn) {
+  if (ui.adBusy) return;
+  ui.adBusy = true;
+  Ads.rewarded().then((r) => {
+    ui.adBusy = false;
+    if (r === 'earned') { sfx('buy'); onEarn(); }
+    else if (r === 'skipped') toast('Watch to the end to get the reward');
+    else if (r === 'unavailable') toast('No ad available right now. Try again in a moment.');
+  });
+}
+
 function cellCenter(r, c) { return [FX0 + c * CELL + CELL / 2, FY0 + r * CELL + CELL / 2]; }
 function toast(text) { ui.toast = { text, t: 2 }; }
 
@@ -872,9 +1107,14 @@ function showResult(g) {
       SAVE.stars[g.level] = Math.max(prev, stars);
       SAVE.unlocked = Math.max(SAVE.unlocked, Math.min(CONFIG.LEVEL_COUNT, g.level + 1));
       SAVE.coins += coins;
-      ui.result = { stars, coins, firstStars: stars > prev };
+      SAVE.winsSinceAd++;
+      SAVE.fails[g.level] = 0;
+      ui.result = { stars, coins, firstStars: stars > prev, doubled: false };
       sfx('win'); openOverlay('win');
-    } else { sfx('lose'); openOverlay('lose'); }
+    } else {
+      SAVE.fails[g.level] = (SAVE.fails[g.level] || 0) + 1;
+      sfx('lose'); openOverlay('lose');
+    }
   } else {
     const score = g.turn - 1;
     const isBest = score > SAVE.best;
@@ -883,6 +1123,7 @@ function showResult(g) {
     const coins = total - (g.coinsPaid || 0);
     g.coinsPaid = total;
     SAVE.coins += coins;
+    if (!g.runCounted) { g.runCounted = true; SAVE.runsSinceAd++; }
     ui.result = { score, isBest, coins };
     sfx('lose'); openOverlay('over');
   }
@@ -970,6 +1211,24 @@ function roundButton(id, cx, cy, r, drawIcon, fn, opt) {
 
 /* ---------- Icons (drawn around 0,0) ---------- */
 const ICON = {
+  ad(c) {
+    ctx.strokeStyle = c; ctx.lineWidth = 3.5; ctx.lineJoin = 'round'; rr(-17, -12, 34, 24, 6); ctx.stroke();
+    ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(-5, -6); ctx.lineTo(7, 0); ctx.lineTo(-5, 6); ctx.closePath(); ctx.fill();
+  },
+  noads(c) {
+    ICON.ad(c);
+    ctx.strokeStyle = COL.danger; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(-20, -18); ctx.lineTo(20, 18); ctx.stroke();
+  },
+  close(c) {
+    ctx.strokeStyle = c; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(-11, -11); ctx.lineTo(11, 11); ctx.moveTo(11, -11); ctx.lineTo(-11, 11); ctx.stroke();
+  },
+  restore(c) {
+    ctx.strokeStyle = c; ctx.lineWidth = 4.5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(0, 0, 13, -Math.PI * 0.2, Math.PI * 1.4); ctx.stroke();
+    ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(14, -13); ctx.lineTo(15, 2); ctx.lineTo(3, -5); ctx.closePath(); ctx.fill();
+  },
   pause(c) { ctx.fillStyle = c; rr(-11, -13, 8, 26, 3); ctx.fill(); rr(3, -13, 8, 26, 3); ctx.fill(); },
   back(c) { ctx.strokeStyle = c; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.beginPath(); ctx.moveTo(6, -13); ctx.lineTo(-7, 0); ctx.lineTo(6, 13); ctx.stroke(); },
   bomb(c) {
@@ -1287,16 +1546,16 @@ function drawBottomBar() {
   const aim = g.phase === 'aim' && !ui.overlay;
   roundButton('bomb', 92, y, 40, () => ICON.bomb(COL.ink), () => {
     if (ui.bombMode) { ui.bombMode = false; return; }
-    if (SAVE.inv.bomb <= 0) { toast('No bombs left. Buy more in the Shop.'); sfx('deny'); return; }
+    if (SAVE.inv.bomb <= 0) { openFree('bomb'); return; }
     ui.bombMode = true;
   }, { count: SAVE.inv.bomb, disabled: !aim, active: ui.bombMode });
   roundButton('double', 196, y, 40, () => ICON.double(g.dblArmed ? '#FFFFFF' : COL.ink), () => {
     if (g.dblArmed) return;
-    if (SAVE.inv.double <= 0) { toast('No x2 left. Buy more in the Shop.'); sfx('deny'); return; }
+    if (SAVE.inv.double <= 0) { openFree('double'); return; }
     SAVE.inv.double--; g.dblArmed = true; persist(); toast('Next shot deals double damage');
   }, { count: SAVE.inv.double, disabled: !aim, active: g.dblArmed });
   roundButton('row', 300, y, 40, () => ICON.row(COL.ink), () => {
-    if (SAVE.inv.row <= 0) { toast('No row clears left. Buy more in the Shop.'); sfx('deny'); return; }
+    if (SAVE.inv.row <= 0) { openFree('row'); return; }
     if (clearLowestRow(g)) { SAVE.inv.row--; persist(); ui.shake = 8; checkInstantWin(); }
   }, { count: SAVE.inv.row, disabled: !!ui.overlay || g.cleared });
 
@@ -1309,6 +1568,9 @@ function drawBottomBar() {
     txt(`${g.ballCount} balls`, 592, y + 2, 22, COL.dim, 'center', FONT_U, 700);
   }
 }
+
+const POWER_NAMES = { bomb: 'Bomb', double: 'x2 Damage', row: 'Row Clear' };
+function openFree(kind) { ui.freeKind = kind; openOverlay('freePower'); }
 
 function checkInstantWin() {
   const g = G;
@@ -1391,7 +1653,7 @@ function header(title, back) {
 }
 
 const LV = { cols: 5, tile: 112, gap: 18, top: 160 };
-function levelsContentH() { return Math.ceil(CONFIG.LEVEL_COUNT / LV.cols) * (LV.tile + 34 + LV.gap) + 40; }
+function levelsContentH() { return Math.ceil(CONFIG.LEVEL_COUNT / LV.cols) * (LV.tile + 34 + LV.gap) + 40 + 130; } // +130 keeps the last row clear of the banner
 function drawLevels() {
   const viewTop = LV.top, viewH = H - viewTop;
   const maxScroll = Math.max(0, levelsContentH() - viewH);
@@ -1433,12 +1695,31 @@ function drawLevels() {
   header('LEVELS', () => goto('title'));
 }
 
-function shopContentH() { return 1300; }
+function shopContentH() { return 1300 + 200 + 130; }
 function drawShop() {
   const top = 140, viewH = H - top;
   ui.scroll.shop = clamp(ui.scroll.shop, 0, Math.max(0, shopContentH() - viewH));
-  const sy = top - ui.scroll.shop;
+  let sy = top - ui.scroll.shop;
   ctx.save(); ctx.beginPath(); ctx.rect(0, top, W, viewH); ctx.clip();
+
+  // Remove Ads
+  {
+    const x = 36, y = sy + 30, w = 648, h = 160;
+    const g = ctx.createLinearGradient(x, y, x + w, y + h);
+    g.addColorStop(0, 'rgba(107,119,214,0.32)'); g.addColorStop(1, 'rgba(18,23,66,0.95)');
+    rr(x, y, w, h, 26); ctx.fillStyle = g; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(155,164,245,0.45)'; ctx.stroke();
+    ctx.save(); ctx.translate(x + 70, y + h / 2); ctx.scale(1.4, 1.4); ICON.noads(COL.ink); ctx.restore();
+    txt('Remove Ads', x + 132, y + 50, 28, COL.ink, 'left', FONT_U, 800);
+    wrapLeftPlain('No ads between levels, no banners. Bonus ads stay optional.', x + 132, y + 88, 330, 18, COL.dim, 24);
+    if (SAVE.noAds) {
+      rr(x + w - 196, y + 50, 172, 60, 30); ctx.fillStyle = 'rgba(63,227,194,0.16)'; ctx.fill();
+      txt('Owned', x + w - 110, y + 81, 24, COL.mint, 'center', FONT_U, 800);
+    } else if (y + 50 > top - 40 && y + 50 < H) {
+      button('removeads', x + w - 196, y + 50, 172, 60, Ads.price, 'gold', buyRemoveAds, { size: 24, disabled: ui.adBusy });
+    }
+  }
+  sy += 200;
 
   spaced('POWER-UPS', W / 2, sy + 40, 20, COL.dim, 4);
   const pw = [
@@ -1482,7 +1763,6 @@ function drawShop() {
     if (isPressed('skin' + i)) { ctx.translate(x + w / 2, y + h / 2); ctx.scale(0.95, 0.95); ctx.translate(-x - w / 2, -y - h / 2); }
     rr(x, y, w, h, 24); ctx.fillStyle = sel ? 'rgba(107,119,214,0.28)' : 'rgba(18,23,66,0.9)'; ctx.fill();
     ctx.lineWidth = sel ? 3 : 2; ctx.strokeStyle = sel ? '#FFFFFF' : 'rgba(155,164,245,0.22)'; ctx.stroke();
-    // preview: ball with a little trail
     const px = x + w / 2 + 20, py = y + 66;
     ctx.strokeStyle = s.trail || `hsl(${(ui.t * 200) % 360},100%,65%)`; ctx.globalAlpha = s.long ? 0.4 : 0.25; ctx.lineWidth = R * 2.2; ctx.lineCap = 'round';
     ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px - (s.long ? 80 : 46), py + (s.long ? 30 : 18)); ctx.stroke(); ctx.globalAlpha = 1;
@@ -1504,6 +1784,29 @@ function drawShop() {
   header('SHOP', () => goto('title'));
 }
 
+function buyRemoveAds() {
+  if (ui.adBusy || SAVE.noAds) return;
+  ui.adBusy = true;
+  Ads.buyRemoveAds().then((r) => {
+    ui.adBusy = false;
+    if (r === 'owned') { sfx('win'); toast('Ads removed. Thank you!'); }
+    else if (r === 'web') toast('Remove Ads is bought in the Android app');
+    else if (r === 'nostore') toast('The store isn’t available right now');
+    else if (r === 'failed') toast('The purchase didn’t go through. Try again.');
+  });
+}
+
+function wrapLeftPlain(s, x, y, maxW, size, color, lh) {
+  ctx.font = `600 ${size}px ${FONT_U}`;
+  const words = s.split(' '); let line = '', yy = y;
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW && line) { txt(line, x, yy, size, color, 'left', FONT_U, 600); line = w; yy += lh; }
+    else line = test;
+  }
+  if (line) txt(line, x, yy, size, color, 'left', FONT_U, 600);
+}
+
 function wrapText(s, x, y, maxW, size, color, lh) {
   ctx.font = `600 ${size}px ${FONT_U}`;
   const words = s.split(' '); let line = '', yy = y;
@@ -1517,11 +1820,11 @@ function wrapText(s, x, y, maxW, size, color, lh) {
 
 function drawSettings() {
   header('SETTINGS', () => goto('title'));
-  button('sound', 160, 220, 400, 92, SAVE.sound ? 'SOUND ON' : 'SOUND OFF', SAVE.sound ? 'primary' : 'secondary', () => {
+  button('sound', 160, 190, 400, 92, SAVE.sound ? 'SOUND ON' : 'SOUND OFF', SAVE.sound ? 'primary' : 'secondary', () => {
     SAVE.sound = !SAVE.sound; persist(); if (SAVE.sound) sfx('click');
   }, { size: 30, icon: (c) => ICON.sound(c, SAVE.sound) });
 
-  spaced('HOW TO PLAY', W / 2, 390, 20, COL.dim, 4);
+  spaced('HOW TO PLAY', W / 2, 340, 20, COL.dim, 4);
   const lines = [
     'Drag up from the floor to aim. Let go to fire every ball.',
     'Each hit takes 1 off a brick. At 0 it breaks.',
@@ -1530,10 +1833,27 @@ function drawSettings() {
     'Levels: clear every brick before you run out of shots.',
     'Challenge: bricks drop one row each turn. Don’t let them reach the floor.',
   ];
-  let y = 440;
-  for (const l of lines) { y = wrapLeft(l, 90, y, 540, 21, COL.ink, 30) + 18; }
+  let y = 390;
+  for (const l of lines) { y = wrapLeft(l, 90, y, 540, 21, COL.ink, 30) + 14; }
 
-  button('reset', 160, 1040, 400, 80, 'RESET PROGRESS', 'danger', () => openOverlay('confirmReset'), { size: 26 });
+  let by = Math.max(y + 20, 860);
+  button('restore', 160, by, 400, 76, SAVE.noAds ? 'ADS REMOVED' : 'RESTORE PURCHASES', 'secondary', () => {
+    if (ui.adBusy) return;
+    ui.adBusy = true;
+    Ads.restore().then((r) => {
+      ui.adBusy = false;
+      if (r === 'owned') toast('Remove Ads restored');
+      else if (r === 'none') toast('No purchases found on this Google account');
+      else if (r === 'web') toast('Purchases are restored in the Android app');
+      else toast('Couldn’t reach the store. Try again.');
+    });
+  }, { size: 22, icon: ICON.restore, disabled: ui.adBusy });
+  by += 92;
+  if (Ads.privacyRequired) {
+    button('privacy', 160, by, 400, 76, 'PRIVACY SETTINGS', 'secondary', () => Ads.privacyForm(), { size: 22 });
+    by += 92;
+  }
+  button('reset', 160, by + 8, 400, 76, 'RESET PROGRESS', 'danger', () => openOverlay('confirmReset'), { size: 24 });
 }
 function wrapLeft(s, x, y, maxW, size, color, lh) {
   ctx.font = `500 ${size}px ${FONT_U}`;
@@ -1561,9 +1881,12 @@ function panel(h, title, titleColor) {
   return { y, done: () => ctx.restore() };
 }
 
+function adCaption(text, y) { txt(text, W / 2, y, 18, COL.dim, 'center', FONT_U, 600); }
+
 function drawOverlay() {
   ui.hits.length = 0; // only overlay buttons are live
   const o = ui.overlay, g = G;
+  const busy = ui.adBusy;
   if (o === 'pause') {
     const p = panel(560, 'PAUSED');
     button('resume', 160, p.y + 150, 400, 92, 'RESUME', 'primary', closeOverlay, { size: 32, icon: ICON.play });
@@ -1573,7 +1896,7 @@ function drawOverlay() {
     p.done();
   } else if (o === 'win') {
     const res = ui.result;
-    const p = panel(640, 'CLEAR!', COL.mint);
+    const p = panel(730, 'CLEAR!', COL.mint);
     for (let i = 0; i < 3; i++) {
       const t0 = 0.25 + i * 0.28, k = clamp((ui.ovT - t0) / 0.3, 0, 1);
       const sc = k === 0 ? 0 : 1 + Math.sin(k * Math.PI) * 0.35;
@@ -1585,43 +1908,112 @@ function drawOverlay() {
     txt(`Level ${g.level}  ·  ${g.shotsUsed} of ${g.shots} shots`, W / 2, p.y + 290, 22, COL.dim, 'center', FONT_U, 600);
     coinIcon(W / 2 - 50, p.y + 344, 16);
     txt(`+${res.coins}`, W / 2 + 14, p.y + 346, 32, COL.gold, 'center', FONT_U, 800);
+    if (!res.doubled) {
+      button('x2coins', 190, p.y + 392, 340, 76, 'DOUBLE COINS', 'gold', () => withReward(() => {
+        SAVE.coins += res.coins; res.coins *= 2; res.doubled = true; persist();
+      }), { size: 24, icon: ICON.ad, disabled: busy });
+    } else adCaption('Coins doubled', p.y + 430);
     const last = g.level >= CONFIG.LEVEL_COUNT;
-    button('next', 160, p.y + 410, 400, 92, last ? 'ALL DONE' : 'NEXT LEVEL', 'primary', () => last ? goto('levels') : startLevel(g.level + 1), { size: 30 });
-    button('retry', 160, p.y + 520, 192, 80, 'RETRY', 'secondary', () => startLevel(g.level), { size: 24 });
-    button('home', 368, p.y + 520, 192, 80, 'LEVELS', 'secondary', () => goto('levels'), { size: 24 });
+    const after = (fn) => () => Ads.between('level', fn);
+    button('next', 160, p.y + 500, 400, 92, last ? 'ALL DONE' : 'NEXT LEVEL', 'primary', after(() => last ? goto('levels') : startLevel(g.level + 1)), { size: 30, disabled: busy });
+    button('retry', 160, p.y + 610, 192, 80, 'RETRY', 'secondary', after(() => startLevel(g.level)), { size: 24, disabled: busy });
+    button('home', 368, p.y + 610, 192, 80, 'LEVELS', 'secondary', after(() => goto('levels')), { size: 24, disabled: busy });
     p.done();
   } else if (o === 'lose') {
-    const p = panel(500, 'OUT OF SHOTS', COL.danger);
     const left = countBricks(g);
+    const canExtra = !g.extraUsed;
+    const canSkip = (SAVE.fails[g.level] || 0) >= MONEY.SKIP_AFTER_FAILS && g.level < CONFIG.LEVEL_COUNT;
+    const h = 250 + (canExtra ? 140 : 0) + (canSkip ? 120 : 0) + 84 + 56;
+    const p = panel(h, 'OUT OF SHOTS', COL.danger);
     txt(`${left} brick${left === 1 ? '' : 's'} left on level ${g.level}`, W / 2, p.y + 160, 24, COL.dim, 'center', FONT_U, 600);
-    txt('Try a different first angle.', W / 2, p.y + 200, 20, COL.faint, 'center', FONT_U, 600);
-    button('retry', 160, p.y + 260, 400, 92, 'RETRY', 'primary', () => startLevel(g.level), { size: 32 });
-    button('home', 160, p.y + 370, 400, 80, 'LEVELS', 'secondary', () => goto('levels'), { size: 26 });
+    txt(canExtra ? 'So close. Want a few more shots?' : 'Try a different first angle.', W / 2, p.y + 200, 20, COL.faint, 'center', FONT_U, 600);
+    let y = p.y + 250;
+    if (canExtra) {
+      button('extra', 160, y, 400, 92, `+${MONEY.EXTRA_SHOTS} SHOTS`, 'gold', () => withReward(() => {
+        g.shots += MONEY.EXTRA_SHOTS; g.extraUsed = true; g.result = null; closeOverlay();
+        toast(`+${MONEY.EXTRA_SHOTS} shots. Finish it!`);
+      }), { size: 30, icon: ICON.ad, disabled: busy });
+      adCaption('Watch a short ad', y + 112);
+      y += 140;
+    }
+    if (canSkip) {
+      button('skip', 160, y, 400, 80, 'SKIP THIS LEVEL', 'secondary', () => withReward(() => {
+        SAVE.unlocked = Math.max(SAVE.unlocked, g.level + 1); SAVE.fails[g.level] = 0; persist();
+        startLevel(g.level + 1);
+      }), { size: 24, icon: ICON.ad, disabled: busy });
+      adCaption(`Stuck? Watch an ad to move on to level ${g.level + 1}`, y + 100);
+      y += 120;
+    }
+    button('retry', 160, y, 192, 84, 'RETRY', canExtra ? 'secondary' : 'primary', () => startLevel(g.level), { size: 26, disabled: busy });
+    button('home', 368, y, 192, 84, 'LEVELS', 'secondary', () => goto('levels'), { size: 24, disabled: busy });
     p.done();
   } else if (o === 'over') {
     const res = ui.result;
-    const canCont = !g.continued;
-    const p = panel(canCont ? 720 : 620, 'GAME OVER', COL.danger);
+    const canFree = !g.continued, canAd = g.continued && !g.adContinued;
+    const p = panel(canFree || canAd ? 720 : 620, 'GAME OVER', COL.danger);
     spaced('YOU SURVIVED', W / 2, p.y + 140, 18, COL.dim, 4);
     txt(String(res.score), W / 2, p.y + 210, 90, COL.ink, 'center', FONT_D, 400);
     txt(res.isBest ? 'NEW BEST!' : `Best ${SAVE.best}`, W / 2, p.y + 280, 24, res.isBest ? COL.gold : COL.dim, 'center', FONT_U, 800);
     if (res.coins > 0) { coinIcon(W / 2 - 40, p.y + 326, 14); txt(`+${res.coins}`, W / 2 + 12, p.y + 328, 26, COL.gold, 'center', FONT_U, 800); }
     let y = p.y + 370;
-    if (canCont) {
-      button('cont', 160, y, 400, 92, 'CONTINUE', 'gold', () => { continueChallenge(g); closeOverlay(); }, { size: 30, sub: null });
-      txt('Clears the bottom 3 rows. Once per run.', W / 2, y + 112, 18, COL.dim, 'center', FONT_U, 600);
+    if (canFree) {
+      button('cont', 160, y, 400, 92, 'CONTINUE', 'gold', () => { continueChallenge(g); closeOverlay(); }, { size: 30, disabled: busy });
+      adCaption('Clears the bottom 3 rows. Free once per run.', y + 112);
+      y += 140;
+    } else if (canAd) {
+      button('cont2', 160, y, 400, 92, 'CONTINUE', 'gold', () => withReward(() => { g.adContinued = true; continueChallenge(g); closeOverlay(); }), { size: 30, icon: ICON.ad, disabled: busy });
+      adCaption('Watch an ad to clear the bottom 3 rows again', y + 112);
       y += 140;
     }
-    button('retry', 160, y, 192, 84, 'RETRY', 'primary', startChallenge, { size: 26 });
-    button('home', 368, y, 192, 84, 'HOME', 'secondary', () => goto('title'), { size: 26 });
+    button('retry', 160, y, 192, 84, 'RETRY', 'primary', () => Ads.between('run', startChallenge), { size: 26, disabled: busy });
+    button('home', 368, y, 192, 84, 'HOME', 'secondary', () => Ads.between('run', () => goto('title')), { size: 26, disabled: busy });
+    p.done();
+  } else if (o === 'freePower') {
+    const k = ui.freeKind, name = POWER_NAMES[k];
+    const p = panel(520, 'OUT OF ' + (k === 'double' ? 'X2' : k === 'bomb' ? 'BOMBS' : 'ROW CLEARS'));
+    ctx.save(); ctx.translate(W / 2, p.y + 170);
+    ctx.beginPath(); ctx.arc(0, 0, 44, 0, 7); ctx.fillStyle = '#1B2160'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(155,164,245,0.5)'; ctx.stroke();
+    ({ bomb: ICON.bomb, double: ICON.double, row: ICON.row })[k](COL.ink); ctx.restore();
+    txt(`Get 1 ${name} for free, or buy more in the Shop.`, W / 2, p.y + 250, 21, COL.dim, 'center', FONT_U, 600);
+    button('freepw', 160, p.y + 300, 400, 92, 'GET 1 FREE', 'gold', () => withReward(() => {
+      SAVE.inv[k]++; persist(); closeOverlay(); toast(`+1 ${name}`);
+    }), { size: 30, icon: ICON.ad, disabled: busy });
+    button('nofree', 160, p.y + 412, 400, 76, 'NOT NOW', 'secondary', closeOverlay, { size: 24, disabled: busy });
     p.done();
   } else if (o === 'confirmReset') {
     const p = panel(470, 'RESET?', COL.danger);
-    wrapText('This wipes your levels, stars, coins and skins on this device. It can’t be undone.', W / 2, p.y + 150, 460, 22, COL.dim, 30);
-    button('yes', 160, p.y + 250, 400, 84, 'YES, RESET', 'danger', () => { SAVE = defaultSave(); persist(); closeOverlay(); toast('Progress reset'); }, { size: 28 });
-    button('no', 160, p.y + 350, 400, 80, 'CANCEL', 'secondary', closeOverlay, { size: 26 });
+    wrapText('This wipes your levels, stars, coins and skins on this device. It can’t be undone. Remove Ads stays on your Google account.', W / 2, p.y + 140, 460, 22, COL.dim, 30);
+    button('yes', 160, p.y + 260, 400, 84, 'YES, RESET', 'danger', () => {
+      const keep = SAVE.noAds; SAVE = defaultSave(); SAVE.noAds = keep; persist(); closeOverlay(); toast('Progress reset');
+    }, { size: 28 });
+    button('no', 160, p.y + 360, 400, 80, 'CANCEL', 'secondary', closeOverlay, { size: 26 });
     p.done();
   }
+}
+
+// Browser stand-in for a real ad (TEST_MODE only).
+function drawFakeAd(dt) {
+  const f = ui.fakeAd;
+  f.t += dt;
+  ui.hits.length = 0;
+  ctx.fillStyle = '#05060F'; ctx.fillRect(0, 0, W, H);
+  const g = ctx.createLinearGradient(0, 300, 0, 900);
+  g.addColorStop(0, '#1B2160'); g.addColorStop(1, '#0A0D24');
+  rr(80, 360, W - 160, 520, 36); ctx.fillStyle = g; ctx.fill();
+  ctx.setLineDash([10, 10]); ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,201,74,0.6)'; ctx.stroke(); ctx.setLineDash([]);
+  txt('TEST AD', W / 2, 470, 64, COL.gold, 'center', FONT_D, 400);
+  txt(f.rewarded ? 'Rewarded ad' : 'Full-screen ad', W / 2, 550, 28, COL.ink, 'center', FONT_U, 800);
+  wrapText('In the Android app a real AdMob ad plays here. This screen only appears in the browser while TEST_MODE is on.', W / 2, 610, 460, 20, COL.dim, 28);
+  const left = Math.max(0, Math.ceil(f.need - f.t));
+  if (f.rewarded) txt(left > 0 ? `Reward in ${left}s` : 'Reward earned', W / 2, 800, 26, left > 0 ? COL.accentHi : COL.mint, 'center', FONT_U, 800);
+  const canClose = f.rewarded || f.t > f.need;
+  if (canClose) {
+    roundButton('adclose', W - 70, 70, 32, () => ICON.close(COL.ink), () => {
+      const earned = f.t >= f.need;
+      ui.fakeAd = null;
+      f.resolve(f.rewarded ? (earned ? 'earned' : 'skipped') : 'done');
+    });
+  } else txt(String(left), W - 70, 72, 30, COL.dim, 'center', FONT_U, 800);
 }
 
 /* =====================================================================
@@ -1649,6 +2041,7 @@ cv.addEventListener('pointerdown', (e) => {
   const h = findHit(p);
   if (h && !h.disabled) { ui.press = h; return; }
   if (h && h.disabled) return;
+  if (ui.fakeAd) return;
   if (ui.screen === 'game' && !ui.overlay && G && G.phase === 'aim' && !G.result) {
     if (ui.bombMode) return;
     ui.aim = p;
@@ -1679,7 +2072,7 @@ function endPointer(e, cancelled) {
     }
     return;
   }
-  if (ui.screen === 'game' && G && !ui.overlay) {
+  if (ui.screen === 'game' && G && !ui.overlay && !ui.fakeAd) {
     if (ui.bombMode && !cancelled && !d.moved) {
       const c = Math.floor((p.x - FX0) / CELL), r = Math.floor((p.y - FY0) / CELL);
       if (r >= 0 && r < ROWS && c >= 0 && c < COLS && G.grid[r][c] && G.grid[r][c].k === 'brick') {
@@ -1704,23 +2097,27 @@ cv.addEventListener('wheel', (e) => {
   if (ui.screen === 'levels' || ui.screen === 'shop') { ui.scroll[ui.screen] += e.deltaY; e.preventDefault(); }
 }, { passive: false });
 window.addEventListener('keydown', (e) => {
-  if (ui.screen !== 'game' || !G) return;
+  if (ui.screen !== 'game' || !G || ui.fakeAd) return;
   if (e.key === 'Escape' || e.key === 'p') { if (ui.overlay === 'pause') closeOverlay(); else if (!ui.overlay) openOverlay('pause'); }
   if (e.key === ' ' && G.phase === 'fire' && G.turnTime > CONFIG.FF_AFTER) { G.ff = !G.ff; e.preventDefault(); }
 });
 // Android back button (only exists inside the Capacitor app): step back a screen
 // or pause, instead of closing the app mid-game.
 try {
-  const CapApp = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
-  if (CapApp) CapApp.addListener('backButton', () => {
-    if (ui.overlay === 'pause' || ui.overlay === 'confirmReset') closeOverlay();
-    else if (ui.screen === 'game') { if (!ui.overlay) openOverlay('pause'); else goto(G && G.mode === 'level' ? 'levels' : 'title'); }
-    else if (ui.screen === 'title') CapApp.exitApp();
-    else goto('title');
-  });
+  const CE = window.capacitorExports;
+  if (CE && CE.Capacitor && CE.Capacitor.isNativePlatform()) {
+    const CapApp = CE.registerPlugin('App');
+    CapApp.addListener('backButton', () => {
+      if (ui.fakeAd || ui.adBusy) return;
+      if (ui.overlay === 'pause' || ui.overlay === 'confirmReset' || ui.overlay === 'freePower') closeOverlay();
+      else if (ui.screen === 'game') { if (!ui.overlay) openOverlay('pause'); else goto(G && G.mode === 'level' ? 'levels' : 'title'); }
+      else if (ui.screen === 'title') CapApp.exitApp();
+      else goto('title');
+    });
+  }
 } catch (e) {}
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && ui.screen === 'game' && !ui.overlay && G && !G.result) openOverlay('pause');
+  if (document.hidden && ui.screen === 'game' && !ui.overlay && !ui.adBusy && G && !G.result) openOverlay('pause');
 });
 
 /* =====================================================================
@@ -1733,7 +2130,7 @@ function frame(now) {
   if (ui.toast) { ui.toast.t -= dt; if (ui.toast.t <= 0) ui.toast = null; }
 
   // simulation (fixed timestep)
-  if (ui.screen === 'game' && G && !ui.overlay) {
+  if (ui.screen === 'game' && G && !ui.overlay && !ui.fakeAd) {
     G.shift = Math.max(0, G.shift - dt / 0.22);
     if (G.phase === 'fire') {
       acc += dt * (G.ff ? CONFIG.FF_MULT : 1);
@@ -1757,6 +2154,14 @@ function frame(now) {
   else if (ui.screen === 'game' && G) drawGame(ui.overlay ? 0 : dt);
   ctx.restore();
   if (ui.overlay) drawOverlay();
+  Ads.setBanner(MONEY.BANNER_SCREENS.includes(ui.screen) && !ui.overlay && !ui.fakeAd);
+  if (Ads.bannerWanted && !Ads.native) {
+    // browser preview of where the banner sits in the app
+    ctx.fillStyle = '#05060F'; ctx.fillRect(0, H - 110, W, 110);
+    ctx.setLineDash([8, 8]); ctx.strokeStyle = 'rgba(255,201,74,0.6)'; ctx.lineWidth = 2; ctx.strokeRect(24, H - 98, W - 48, 86); ctx.setLineDash([]);
+    txt('TEST BANNER AD', W / 2, H - 55, 22, COL.gold, 'center', FONT_U, 800);
+  }
+  if (ui.fakeAd) drawFakeAd(dt);
   if (ui.toast) {
     const a = Math.min(1, ui.toast.t / 0.3);
     ctx.globalAlpha = a;

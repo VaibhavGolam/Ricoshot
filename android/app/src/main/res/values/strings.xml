@@ -4,4 +4,6 @@
     <string name="title_activity_main">Ricoshot</string>
     <string name="package_name">com.golamlab.ricoshot</string>
     <string name="custom_url_scheme">com.golamlab.ricoshot</string>
+    <!-- Google's TEST AdMob app ID. Replace with your own "ca-app-pub-...~..." before release. -->
+    <string name="admob_app_id">ca-app-pub-3940256099942544~3347511713</string>
 </resources>
