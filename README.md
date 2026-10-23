@@ -2,7 +2,9 @@
 
 A balls-vs-bricks shooter for Android. Aim once, fire the whole volley, and break every brick before you run out of shots.
 
-- 60 levels (15 hand-built, 45 generated from a fixed seed) with 1 to 3 stars each
+- 2,000 levels (15 hand-built, the rest generated from a fixed seed, so every phone gets the same levels) with 1 to 3 stars each
+- 12 level layouts (pyramids, stripes, frames, pillars and more) and a boss level every 10 levels
+- Fills the whole screen on any phone shape, no black bars
 - Endless Challenge mode where bricks drop a row every turn
 - Pickups: +1 ball rings, row and column lasers, scatter stars, coins
 - Power-ups: Bomb, x2 Damage, Row Clear
@@ -19,7 +21,8 @@ www/                 the game itself (one index.html + bundled fonts)
 www/vendor/          Capacitor's bridge script, copied in by npm install
 android/             the Android app that wraps the game (Capacitor)
 assets/              icon and splash source images
-tools/level-bot.js   plays every level to check the shot limits are fair
+tools/level-bot.js   plays levels with a bot to check the shot limits are fair
+tools/measure-shots.js  re-measures shot limits after you change the level generator
 tools/copy-vendor.js copies the bridge script after npm install
 .github/workflows/   builds the APK on GitHub
 ```
@@ -126,9 +129,25 @@ npx capacitor-assets generate --android --iconBackgroundColor '#0A0D28' --splash
 
 ## Tuning the game
 
-All the numbers are in the `CONFIG` block at the top of the script in `www/index.html`: ball speed, fire delay, star thresholds, prices, challenge difficulty.
+All the numbers are in the `CONFIG` block at the top of the script in `www/index.html`: ball speed, fire delay, star thresholds, prices, challenge difficulty, `LEVEL_COUNT`.
 
-If you change levels, ball counts or physics, run `node tools/level-bot.js` and check that every level still shows at least 75% bot win rate. Adjust the `shots` values (levels 1 to 15) or the `GEN_SHOTS` list (levels 16 to 60) if not.
+### How the levels work
+
+- Levels 1 to 15 are written by hand in `HAND_LEVELS`.
+- Levels 16 to 2,000 come from `genLevel()`. It picks one of 12 layouts per level, scales ball count (up to about 80) and brick HP with the level number, and makes every 10th level from 20 on a boss level.
+- Each generated level's shot limit is stored in `GEN_SHOTS`. These were measured by playing every level 12 times with an aiming bot and allowing about 15 to 25% more shots than the bot needed.
+
+If you change the generator, ball speed or brick sizes, re-measure the shot limits. The full run takes about 25 minutes:
+
+```
+node tools/measure-shots.js 16 2000 12 > shots.json
+```
+
+Then paste the array from `shots.json` into `GEN_SHOTS`. To spot-check a few levels: `node tools/level-bot.js 500 520`.
+
+### Screen fit
+
+The game is always 720 units wide. Its height follows the phone's shape, from 1280 (a 9:16 screen) up to 1760 (very tall phones), so it fills the screen. The brick grid never changes size; the extra height becomes launch space under the bricks and a little room above them. Tablets and desktop browsers show the game at 9:16 with plain margins at the sides.
 
 ## Fonts
 
